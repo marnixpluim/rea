@@ -2,6 +2,7 @@ import * as t from "@babel/types";
 
 import {
   failedJavaScriptSemanticIr,
+  type JavaScriptBindingProvenance,
   type JavaScriptModuleOrigin,
   type JavaScriptSemanticDefinition,
   type JavaScriptSemanticIr,
@@ -29,6 +30,7 @@ import {
   semanticVariableScope,
 } from "./javascriptSemanticState.js";
 import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
+import { evaluateSemanticProvenance } from "./javascriptSemanticValues.js";
 import { collectSemanticMemberMutations } from "./javascriptSemanticMemberMutations.js";
 import {
   collectSemanticReturns,
@@ -280,6 +282,62 @@ const resolveGlobalAliasFact = (
   )
     return undefined;
   return openGlobalFact(name);
+};
+
+const ELECTRON_MODULE = /^electron(?:\/(?:common|main|renderer|utility))?$/u;
+
+/**
+ * Electron export paths for call and construction roots bound to Electron
+ * under another name, such as esbuild's `import { ipcMain as ipcMain2 }`.
+ * Keys are root identifier offsets; roots spelled as their export are omitted.
+ */
+export const classifyParsedJavaScriptElectronBindings = (
+  file: ParsedJavaScriptSource,
+): ReadonlyMap<number, string> => {
+  const facts = new Map<number, string>();
+  const state = createState(file.program);
+  collectDefinitions(file.program, state);
+  const exportsByBinding = new Map<string, string | null>();
+  traverseJavaScriptAst(file.program, {
+    enter: (node) => {
+      if (
+        !t.isCallExpression(node) &&
+        !t.isOptionalCallExpression(node) &&
+        !t.isNewExpression(node)
+      )
+        return;
+      const root = calleeRoot(node.callee);
+      if (root === undefined) return;
+      const binding = resolveSemanticBindingState(state, root, root.name);
+      if (binding === undefined) return;
+      let exported = exportsByBinding.get(binding.bindingId);
+      if (exported === undefined) {
+        exported = electronExport(evaluateSemanticProvenance(binding, state));
+        exportsByBinding.set(binding.bindingId, exported);
+      }
+      if (exported !== null && exported !== root.name)
+        facts.set(root.start ?? -1, exported);
+    },
+  });
+  return facts;
+};
+
+const calleeRoot = (node: t.Node): t.Identifier | undefined => {
+  while (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) {
+    if (!t.isNode(node.object)) return undefined;
+    node = node.object;
+  }
+  return t.isIdentifier(node) ? node : undefined;
+};
+
+const electronExport = (
+  provenance: JavaScriptBindingProvenance,
+): string | null => {
+  if (provenance.status !== "module") return null;
+  const [{ specifier, importedPath }] = provenance.origins;
+  return ELECTRON_MODULE.test(specifier) && importedPath.length > 0
+    ? importedPath.join(".")
+    : null;
 };
 
 const createState = (program: t.Program): JavaScriptSemanticAnalysisState => {
