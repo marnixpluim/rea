@@ -2,7 +2,6 @@ import * as t from "@babel/types";
 
 import {
   failedJavaScriptSemanticIr,
-  type JavaScriptBindingProvenance,
   type JavaScriptModuleOrigin,
   type JavaScriptSemanticDefinition,
   type JavaScriptSemanticIr,
@@ -30,7 +29,7 @@ import {
   semanticVariableScope,
 } from "./javascriptSemanticState.js";
 import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
-import { evaluateSemanticProvenance } from "./javascriptSemanticValues.js";
+import { semanticRequireOrigin } from "./javascriptSemanticRequireOrigin.js";
 import { collectSemanticMemberMutations } from "./javascriptSemanticMemberMutations.js";
 import {
   collectSemanticReturns,
@@ -312,7 +311,7 @@ export const classifyParsedJavaScriptElectronBindings = (
       if (binding === undefined) return;
       let exported = exportsByBinding.get(binding.bindingId);
       if (exported === undefined) {
-        exported = electronExport(evaluateSemanticProvenance(binding, state));
+        exported = electronExport(binding, state);
         exportsByBinding.set(binding.bindingId, exported);
       }
       if (exported !== null && exported !== root.name)
@@ -330,14 +329,36 @@ const calleeRoot = (node: t.Node): t.Identifier | undefined => {
   return t.isIdentifier(node) ? node : undefined;
 };
 
+// Read import and require origins directly; general value evaluation is
+// unnecessary here and costly across large vendor bundles.
 const electronExport = (
-  provenance: JavaScriptBindingProvenance,
+  binding: JavaScriptSemanticBindingState,
+  state: JavaScriptSemanticAnalysisState,
 ): string | null => {
-  if (provenance.status !== "module") return null;
-  const [{ specifier, importedPath }] = provenance.origins;
-  return ELECTRON_MODULE.test(specifier) && importedPath.length > 0
-    ? importedPath.join(".")
+  const origin = bindingOrigin(binding, state);
+  return origin !== undefined &&
+    ELECTRON_MODULE.test(origin.specifier) &&
+    origin.importedPath.length > 0
+    ? origin.importedPath.join(".")
     : null;
+};
+
+const bindingOrigin = (
+  binding: JavaScriptSemanticBindingState,
+  state: JavaScriptSemanticAnalysisState,
+): JavaScriptModuleOrigin | undefined => {
+  if (binding.directOrigins.length > 0)
+    return binding.directOrigins.length === 1
+      ? binding.directOrigins[0]
+      : undefined;
+  const [initializer] = binding.initializers;
+  if (binding.mutable || binding.initializers.length !== 1) return undefined;
+  const origin = semanticRequireOrigin(initializer?.node, state);
+  const projection = initializer?.projection ?? [];
+  return origin === undefined ||
+    !projection.every((key): key is string => typeof key === "string")
+    ? undefined
+    : { ...origin, importedPath: [...origin.importedPath, ...projection] };
 };
 
 const createState = (program: t.Program): JavaScriptSemanticAnalysisState => {
